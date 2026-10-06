@@ -1,0 +1,578 @@
+{
+  "name": "Vapi Call Assistant",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vapi-clinic-call",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "1ca5f0a4-29ef-41c2-a99d-c7822c13c1bd",
+      "name": "Vapi Webhook1",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1616,
+        96
+      ],
+      "webhookId": "vapi-clinic-call"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.item.json.body || $input.item.json;\nconst message = body.message || body;\nconst call = message.call || {};\nconst analysis = message.analysis || {};\n \nfunction parseArgs(raw) {\n  if (!raw) return {};\n  if (typeof raw === 'object') return raw;\n  try { return JSON.parse(raw); } catch (e) { return {}; }\n}\n \n// Two possible payload shapes coming from Vapi:\n// 1) \"tool-calls\" event (fires mid-call): the save_call_data arguments live at\n//    the top level, message.toolCalls[0].function.arguments\n// 2) \"end-of-call-report\" event (fires when the call ends): message.toolCalls\n//    is NOT present at the top level. The save_call_data call that happened\n//    during the conversation is instead buried inside\n//    message.artifact.messages[], as one of the message entries with a\n//    toolCalls array. We have to search for it there.\nlet toolCall = (message.toolCalls && message.toolCalls[0]) || null;\nconst isLiveToolCallEvent = !!toolCall;\n \nif (!toolCall) {\n  const artifactMessages = (message.artifact && message.artifact.messages) || [];\n  for (const m of artifactMessages) {\n    if (Array.isArray(m.toolCalls)) {\n      const found = m.toolCalls.find(\n        tc => tc.function && tc.function.name === 'save_call_data'\n      );\n      if (found) {\n        toolCall = found;\n        break;\n      }\n    }\n  }\n}\n \nconst toolArgs = toolCall ? parseArgs(toolCall.function && toolCall.function.arguments) : {};\nconst toolCallId = toolCall ? toolCall.id : null;\n \nconst structured = analysis.structuredData || message.structuredData || toolArgs || {};\n \nfunction clean(val, fallback) {\n  if (val === undefined || val === null) return fallback;\n  const s = String(val).trim();\n  return s.length ? s : fallback;\n}\n \nfunction normalizeReason(raw) {\n  if (!raw) return 'General Inquiry';\n  const r = String(raw).toLowerCase().replace(/[_]+/g, ' ').trim();\n  if (r.includes('reschedul')) return 'Reschedule';\n  if (r.includes('new appointment') || r.includes('booking')) return 'New Appointment';\n  return 'General Inquiry';\n}\n \nconst callerName = clean(structured.caller_name || structured.callerName, 'Not provided');\nconst reasonForCall = normalizeReason(structured.reason_for_call || structured.reasonForCall);\nconst requestedDatetime = clean(\n  structured.requested_datetime || structured.requestedDateTime || structured.preferred_datetime || structured.preferredDatetime,\n  'Not provided'\n);\nconst callbackNumberRaw = clean(\n  structured.callback_number || structured.callbackNumber || (call.customer && call.customer.number),\n  'Not provided'\n);\n// Airtable's \"CallBack number\" column is a Number field, so strip everything\n// except digits (drops the leading \"+\" etc.) or it will fail to save.\nconst callbackNumber = callbackNumberRaw === 'Not provided'\n  ? 'Not provided'\n  : callbackNumberRaw.replace(/[^0-9]/g, '');\n \n// Never mark a call Booked unless a real booking system explicitly confirmed it.\nlet callStatus = 'New';\nconst explicitlyBooked = structured.booking_confirmed === true || structured.call_status === 'Booked';\nif (explicitlyBooked) {\n  callStatus = 'Booked';\n} else if (\n  callerName === 'Not provided' ||\n  callbackNumber === 'Not provided' ||\n  (requestedDatetime === 'Not provided' && reasonForCall !== 'General Inquiry')\n) {\n  callStatus = 'Needs Follow Up';\n}\n \nconst timestamp = call.startedAt || message.timestamp || new Date().toISOString();\n \nconst summary = analysis.summary || message.summary;\nconst transcript = message.transcript || call.transcript;\nconst transcriptOrSummary = clean(summary || transcript, 'No transcript or summary available.');\n \n// A payload counts as \"valid\" if we can identify it as an actual Vapi call event\n// (has a call object, analysis object, structured data, transcript, or a tool call\n// found either at the top level or inside the artifact).\nconst rawValid = !!(call.id || analysis.summary || Object.keys(structured).length > 0 || message.transcript || toolCall);\n \nreturn [\n  {\n    json: {\n      caller_name: callerName,\n      reason_for_call: reasonForCall,\n      requested_datetime: requestedDatetime,\n      callback_number: callbackNumber,\n      call_status: callStatus,\n      timestamp: timestamp,\n      transcript_or_summary: transcriptOrSummary,\n      _raw_valid: rawValid,\n      _is_tool_call: isLiveToolCallEvent,\n      _tool_call_id: toolCallId,\n      _event_type: message.type || null\n    }\n  }\n];"
+      },
+      "id": "81c6d91a-71e9-4463-938b-f9b626c4ff42",
+      "name": "Parse & Clean Vapi Data1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1408,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json._raw_valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c4df6825-0dea-4ec5-9652-c5774109aad7",
+      "name": "Validate Data1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -1168,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json._is_tool_call ? { results: [ { toolCallId: $json._tool_call_id, result: \"No usable caller data received.\" } ] } : { success: false, message: \"Invalid call data received\" } }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "1936e4b5-29ea-4657-9271-ee456630b43b",
+      "name": "Invalid Response1",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -896,
+        608
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": {
+          "__rl": true,
+          "value": "appt2MN8WRAmdpEzT",
+          "mode": "id"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tblsKgDYU7GJCQW1R",
+          "mode": "id"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Caller Name": "={{ $json.caller_name }}",
+            "CallBack number": "={{ $('Parse & Clean Vapi Data1').item.json.callback_number }}",
+            "Reason for call": "={{ $('Parse & Clean Vapi Data1').item.json.reason_for_call }}",
+            "Status": "={{ $('Parse & Clean Vapi Data1').item.json.call_status }}",
+            "Summary": "={{ $('Parse & Clean Vapi Data1').item.json.transcript_or_summary }}",
+            "Requested time/date": "={{ $json.requested_datetime }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Caller Name",
+              "displayName": "Caller Name",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Reason for call",
+              "displayName": "Reason for call",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Requested time/date",
+              "displayName": "Requested time/date",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "dateTime",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "New",
+                  "value": "New"
+                },
+                {
+                  "name": "Needs Follow-up",
+                  "value": "Needs Follow-up"
+                },
+                {
+                  "name": "Booked",
+                  "value": "Booked"
+                },
+                {
+                  "name": "",
+                  "value": ""
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "CallBack number",
+              "displayName": "CallBack number",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": true,
+              "removed": true
+            },
+            {
+              "id": "Summary",
+              "displayName": "Summary",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "typecast": true
+        }
+      },
+      "id": "c50e2c9a-7b4c-4ece-abda-71cb171e123e",
+      "name": "Airtable - Create Record1",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        -880,
+        16
+      ],
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "P3GHXjAhjD0gMdqA",
+          "name": "Airtable Personal Access Token account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {},
+      "id": "3d4a64eb-d4c1-4349-9c41-642247813388",
+      "name": "Wait Before Retry1",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -576,
+        336
+      ],
+      "webhookId": "1caca938-833d-4b35-b870-701b4fba974f"
+    },
+    {
+      "parameters": {
+        "authentication": "airtableOAuth2Api",
+        "operation": "create",
+        "base": {
+          "__rl": true,
+          "value": "appt2MN8WRAmdpEzT",
+          "mode": "id"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tblsKgDYU7GJCQW1R",
+          "mode": "id"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Caller Name": "={{ $('Parse & Clean Vapi Data1').item.json.caller_name }}",
+            "CallBack number": 0
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Caller Name",
+              "displayName": "Caller Name",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Reason for call",
+              "displayName": "Reason for call",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Requested time/date",
+              "displayName": "Requested time/date",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "New",
+                  "value": "New"
+                },
+                {
+                  "name": "Needs Followup",
+                  "value": "Needs Followup"
+                },
+                {
+                  "name": "Booked",
+                  "value": "Booked"
+                },
+                {
+                  "name": "",
+                  "value": ""
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "CallBack number",
+              "displayName": "CallBack number",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "dateTime",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Summary",
+              "displayName": "Summary",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "0e7d36e3-3cdd-4aa6-86e7-30d9caa4ab0b",
+      "name": "Airtable - Retry Create Record1",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        -288,
+        336
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0BTGPDRMGX",
+          "mode": "list",
+          "cachedResultName": "errors"
+        },
+        "text": "=🚨 *Clinic Call Workflow Error*\n\nAirtable record creation failed after retry.\n\n*Caller:* {{ $('Parse & Clean Vapi Data1').item.json.caller_name }}\n*Reason:* {{ $('Parse & Clean Vapi Data1').item.json.reason_for_call }}\n*Callback Number:* {{ $('Parse & Clean Vapi Data1').item.json.callback_number }}\n*Error:* {{ $json.error?.message ?? 'Unknown error' }}\n*Timestamp:* {{ $('Parse & Clean Vapi Data1').item.json.timestamp }}",
+        "otherOptions": {}
+      },
+      "id": "f5fb788c-a7ed-4c28-b767-65934d46f76f",
+      "name": "Slack - #errors1",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        352
+      ],
+      "webhookId": "861e0d8e-7da8-4e44-9000-c66068b9719b"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $('Parse & Clean Vapi Data1').item.json._is_tool_call ? { results: [ { toolCallId: $('Parse & Clean Vapi Data1').item.json._tool_call_id, result: \"Failed to save caller information, please try again.\" } ] } : { success: false, message: \"Clinic call could not be stored\" } }}",
+        "options": {
+          "responseCode": 502
+        }
+      },
+      "id": "bde46db4-3e5f-4b5f-8eb0-fe8254f4a730",
+      "name": "Failure Response1",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        192,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0BUSD35SSC",
+          "mode": "list",
+          "cachedResultName": "front-desk"
+        },
+        "text": "={{ ($json.fields[\"Status\"] === 'Booked' ? '🟢' : ($json.fields[\"Status\"] === 'Needs Follow-up' ? '🔴' : '🟡')) + ' *New Clinic Call*' }}\n\n*Caller:* {{ $json.fields[\"Caller Name\"] }}\n*Reason:* {{ $json.fields[\"Reason for call\"] }}\n*Requested Date/Time:* {{ $json.fields[\"Requested time/date\"] }}\n*Callback Number:* {{ $json.fields[\"CallBack number\"] }}\n*Status:* {{ $json.fields[\"Status\"] }}\n*Received:* {{ $json.fields[\"timestamp\"] }}\n\n*Summary:*\n{{ $json.fields[\"Summary\"] }}",
+        "otherOptions": {}
+      },
+      "id": "0ed15810-52a5-4b6f-a0af-8d3ed2f0eff6",
+      "name": "Slack - #front-desk1",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "0630870e-abc8-401c-9dc8-d35d61ed46c4"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $('Parse & Clean Vapi Data1').item.json._is_tool_call ? { results: [ { toolCallId: $('Parse & Clean Vapi Data1').item.json._tool_call_id, result: \"Caller information saved successfully.\" } ] } : { success: true, message: \"Clinic call processed successfully\" } }}",
+        "options": {}
+      },
+      "id": "5a68abed-8cf8-4643-9b43-baca84cfdd1a",
+      "name": "Success Response1",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        192,
+        0
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Vapi Webhook1": {
+      "main": [
+        [
+          {
+            "node": "Parse & Clean Vapi Data1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Clean Vapi Data1": {
+      "main": [
+        [
+          {
+            "node": "Validate Data1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Data1": {
+      "main": [
+        [
+          {
+            "node": "Airtable - Create Record1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Invalid Response1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Airtable - Create Record1": {
+      "main": [
+        [
+          {
+            "node": "Slack - #front-desk1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait Before Retry1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Before Retry1": {
+      "main": [
+        [
+          {
+            "node": "Airtable - Retry Create Record1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Airtable - Retry Create Record1": {
+      "main": [
+        [
+          {
+            "node": "Slack - #front-desk1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack - #errors1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - #errors1": {
+      "main": [
+        [
+          {
+            "node": "Failure Response1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - #front-desk1": {
+      "main": [
+        [
+          {
+            "node": "Success Response1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "7d0b10e0-1c6e-46f9-adbc-426eba8c6c42",
+  "meta": {
+    "instanceId": "925f0d8eab330603f3d2c887e7c35df7bf593754c419729f0cac7d9de4c49978"
+  },
+  "nodeGroups": [],
+  "id": "EIT8MfzEQUdrew4z",
+  "tags": []
+}
